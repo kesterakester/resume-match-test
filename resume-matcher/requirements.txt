@@ -1,9 +1,18 @@
-fastapi
-uvicorn
-python-multipart
-spacy
-pdfminer.six
-scikit-learn
-numpy
-pandas
-en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# Core Framework
+fastapi>=0.68.0,<1.0.0
+uvicorn>=0.15.0,<1.0.0
+python-multipart>=0.0.5,<1.0.0
+
+# NLP & ML
+# Pin numpy to a safe version that works with pandas and scikit-learn without compilation issues
+numpy>=1.23.0,<2.0.0
+pandas>=1.5.0,<2.0.0
+scikit-learn>=1.0.0,<2.0.0
+spacy>=3.0.0,<4.0.0
+
+# PDF Processing
+pdfminer.six>=20221105
+
+# Spacy Model (Direct link ensures compatibility)
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
