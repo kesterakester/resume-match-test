@@ -4,14 +4,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pdfminer.high_level import extract_text
 import spacy
 from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import re
 import io
 import json
+import os
+from openai import OpenAI
 
 app = FastAPI()
 
-# Allow CORS for frontend
+# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,7 +37,22 @@ def extract_contact_info(text):
         "phone": phone[0] if phone else None
     }
 
-def calculate_ats_score(text, resume_data):
+def extract_keywords_basic(text, n=15):
+    """
+    Fallback keyword extraction using frequency analysis.
+    Exclude common english stop words.
+    """
+    try:
+        # Use simple CountVectorizer to find top frequent words that are not stop words
+        vectorizer = CountVectorizer(stop_words='english', max_features=n, ngram_range=(1, 2))
+        X = vectorizer.fit_transform([text])
+        keywords = vectorizer.get_feature_names_out()
+        return list(keywords)
+    except:
+        return []
+
+def calculate_rule_based_score(text, resume_data):
+    """Fallback rule-based scoring"""
     score = 0
     feedback = []
     breakdown = {"contact_info": 0, "structure": 0, "content_length": 0, "keywords": 0}
@@ -69,10 +85,8 @@ def calculate_ats_score(text, resume_data):
         feedback.append("Resume might be too long. Try to keep it concise.")
 
     # 3. Structure & Sections (30 pts)
-    # Simple check for common headers
     sections = ["experience", "education", "skills", "projects", "summary", "profile"]
     found_sections = [s for s in sections if s in text.lower()]
-    
     section_score = min(len(found_sections) * 5, 30)
     score += section_score
     breakdown["structure"] += section_score
@@ -81,11 +95,9 @@ def calculate_ats_score(text, resume_data):
     if missing_sections:
         feedback.append(f"Consider adding these sections: {', '.join(missing_sections)}")
 
-    # 4. Action Verbs & Keywords (30 pts)
-    # Basic check for action verbs
+    # 4. Keyword Check (Action Verbs) (30 pts)
     action_verbs = ["managed", "developed", "led", "created", "designed", "implemented", "analyzed", "collaborated"]
     found_verbs = [v for v in action_verbs if v in text.lower()]
-    
     keyword_score = min(len(found_verbs) * 4, 30)
     score += keyword_score
     breakdown["keywords"] += keyword_score
@@ -99,6 +111,46 @@ def calculate_ats_score(text, resume_data):
         "feedback": feedback
     }
 
+async def get_ai_analysis(text):
+    """Complete analysis using OpenAI if available"""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    client = OpenAI(api_key=api_key)
+
+    prompt = f"""
+    You are an expert ATS and Tech Recruiter. 
+    Analyze the following resume text. Provide a JSON response with the following structure:
+    {{
+        "total_score": <number 0-100>,
+        "breakdown": {{
+             "contact_info": <number 0-20>,
+             "structure": <number 0-30>,
+             "content_length": <number 0-20>,
+             "keywords": <number 0-30>
+        }},
+        "feedback": [<list of strings, specific improvements>],
+        "extracted_keywords": [<list of strings, top 10-15 most important technical skills, tools, and job-relevant terms found in the resume. Format them as simple search terms (e.g. 'Python', 'React', 'Data Analysis') so they can be used to search a job database.>],
+        "missing_skills": [<list of strings, crucial skills missing for the apparent role>]
+    }}
+    
+    Resume Text:
+    {text[:4000]} 
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        content = response.choices[0].message.content
+        return json.loads(content)
+    except Exception as e:
+        print(f"AI Analysis failed: {e}")
+        return None
+
 @app.post("/api/parser")
 async def parse_resume(file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
@@ -107,14 +159,32 @@ async def parse_resume(file: UploadFile = File(...)):
     content = await file.read()
     
     try:
-        # Extract text using pdfminer
+        # Extract Text
         text = extract_text(io.BytesIO(content))
-        
-        # Extract basic info
         contact = extract_contact_info(text)
         
-        # Calculate Score
-        scoring = calculate_ats_score(text, contact)
+        # 1. Calculate Rule-Based Score (Baseline)
+        rule_score = calculate_rule_based_score(text, contact)
+        
+        # 2. Try AI Analysis
+        ai_score = await get_ai_analysis(text)
+        
+        # Merge Results
+        final_scoring = rule_score
+        keywords = extract_keywords_basic(text) # Default fallback keywords
+
+        if ai_score:
+            final_scoring = {
+                "total_score": ai_score.get("total_score", rule_score["total_score"]),
+                "breakdown": ai_score.get("breakdown", rule_score["breakdown"]),
+                "feedback": ai_score.get("feedback", rule_score["feedback"])
+            }
+            if "missing_skills" in ai_score:
+                final_scoring["feedback"].append(f"Recommended Skills: {', '.join(ai_score['missing_skills'][:5])}")
+            
+            # Use AI extracted keywords if available and valid
+            if "extracted_keywords" in ai_score and ai_score["extracted_keywords"]:
+                keywords = ai_score["extracted_keywords"]
         
         return {
             "resume": {
@@ -122,19 +192,20 @@ async def parse_resume(file: UploadFile = File(...)):
                     "email": contact["email"],
                     "phone": contact["phone"]
                 },
-                "text": text[:500] + "..." # Preview
+                "text": text[:500] + "..."
             },
             "score": {
-                "totalScore": scoring["total_score"],
+                "totalScore": final_scoring["total_score"],
                 "breakdown": {
-                    "contactInfo": scoring["breakdown"]["contact_info"],
-                    "education": scoring["breakdown"]["structure"], # Mapping structure to education category equivalent
-                    "experience": scoring["breakdown"]["content_length"],
-                    "skills": scoring["breakdown"]["keywords"],
+                    "contactInfo": final_scoring["breakdown"]["contact_info"],
+                    "education": final_scoring["breakdown"]["structure"],
+                    "experience": final_scoring["breakdown"]["content_length"],
+                    "skills": final_scoring["breakdown"]["keywords"],
                     "summary": 0
                 },
-                "feedback": scoring["feedback"]
-            }
+                "feedback": final_scoring["feedback"]
+            },
+            "keywords": keywords # Searchable keywords for Job Matching
         }
         
     except Exception as e:
