@@ -13,7 +13,8 @@ COPY requirements.txt .
 
 # Upgrade pip and install dependencies with a higher timeout to prevent network flakes
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt --timeout 100
+    pip install --no-cache-dir -r requirements.txt --timeout 100 && \
+    python -m spacy download en_core_web_sm
 
 COPY . .
 
