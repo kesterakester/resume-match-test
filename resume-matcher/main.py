@@ -29,12 +29,26 @@ except:
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
 
-def extract_contact_info(text):
+def extract_profile_info(text, nlp_doc):
     email = re.findall(r'[\w\.-]+@[\w\.-]+', text)
     phone = re.findall(r'(\d{3}[-\.\s]??\d{3}[-\.\s]??\d{4}|\(\d{3}\)\s*\d{3}[-\.\s]??\d{4}|\d{3}[-\.\s]??\d{4})', text)
+    
+    # Attempt to find a name (PERSON) and location (GPE) using Spacy
+    person_name = None
+    location = None
+    
+    # Heuristic: The first PERSON entity found in the first 500 characters is likely the name
+    for ent in nlp_doc.ents:
+        if ent.label_ == "PERSON" and not person_name:
+            person_name = ent.text
+        if ent.label_ == "GPE" and not location:
+            location = ent.text
+            
     return {
         "email": email[0] if email else None,
-        "phone": phone[0] if phone else None
+        "phone": phone[0] if phone else None,
+        "name": person_name,
+        "location": location
     }
 
 def extract_keywords_basic(text, n=15):
@@ -55,7 +69,7 @@ def calculate_rule_based_score(text, resume_data):
     """Fallback rule-based scoring"""
     score = 0
     feedback = []
-    breakdown = {"contact_info": 0, "structure": 0, "content_length": 0, "keywords": 0}
+    breakdown = {"contact_info": 0, "structure": 0, "content_length": 0, "keywords": 0, "impact": 0}
 
     # 1. Contact Info (20 pts)
     if resume_data["email"]:
@@ -84,10 +98,10 @@ def calculate_rule_based_score(text, resume_data):
         breakdown["content_length"] += 10
         feedback.append("Resume might be too long. Try to keep it concise.")
 
-    # 3. Structure & Sections (30 pts)
+    # 3. Structure & Sections (20 pts - Adjusted)
     sections = ["experience", "education", "skills", "projects", "summary", "profile"]
     found_sections = [s for s in sections if s in text.lower()]
-    section_score = min(len(found_sections) * 5, 30)
+    section_score = min(len(found_sections) * 4, 20)
     score += section_score
     breakdown["structure"] += section_score
     
@@ -95,15 +109,31 @@ def calculate_rule_based_score(text, resume_data):
     if missing_sections:
         feedback.append(f"Consider adding these sections: {', '.join(missing_sections)}")
 
-    # 4. Keyword Check (Action Verbs) (30 pts)
-    action_verbs = ["managed", "developed", "led", "created", "designed", "implemented", "analyzed", "collaborated"]
+    # 4. Keyword Check (Action Verbs) (20 pts - Adjusted)
+    action_verbs = ["managed", "developed", "led", "created", "designed", "implemented", "analyzed", "collaborated", "engineered", "optimized"]
     found_verbs = [v for v in action_verbs if v in text.lower()]
-    keyword_score = min(len(found_verbs) * 4, 30)
+    keyword_score = min(len(found_verbs) * 2, 20)
     score += keyword_score
     breakdown["keywords"] += keyword_score
     
-    if len(found_verbs) < 3:
-        feedback.append("Use more strong action verbs (e.g., Managed, Developed, Led).")
+    if len(found_verbs) < 5:
+        feedback.append("Use more strong action verbs (e.g., Managed, Developed, Led, Optimized).")
+
+    # 5. Quantifiable Impact (20 pts - NEW)
+    # detecting %, $, numbers followed by impact words like 'growth', 'reduction', 'increase'
+    metrics = re.findall(r'(\d+%|\$\d+|\d+\s\+)', text)
+    impact_words = ["increased", "decreased", "reduced", "improved", "grew", "saved", "generated"]
+    found_impact_words = [w for w in impact_words if w in text.lower()]
+    
+    if len(metrics) >= 3 or (len(metrics) > 0 and len(found_impact_words) > 0):
+        score += 20
+        breakdown["impact"] += 20
+    elif len(metrics) > 0:
+        score += 10
+        breakdown["impact"] += 10
+        feedback.append("Good start with numbers, but try to quantify more results (e.g., 'Increased sales by 20%').")
+    else:
+        feedback.append("Add quantifiable results! (e.g. use numbers, percentages, and dollar amounts to show impact).")
 
     return {
         "total_score": score,
@@ -126,14 +156,19 @@ async def get_ai_analysis(text):
         "total_score": <number 0-100>,
         "breakdown": {{
              "contact_info": <number 0-20>,
-             "structure": <number 0-30>,
+             "structure": <number 0-20>,
              "content_length": <number 0-20>,
-             "keywords": <number 0-30>
+             "keywords": <number 0-20>,
+             "impact": <number 0-20>
         }},
         "feedback": [<list of strings, specific improvements>],
-        "extracted_keywords": [<list of strings, top 10-15 most important technical skills, tools, and job-relevant terms found in the resume. Format them as simple search terms (e.g. 'Python', 'React', 'Data Analysis') so they can be used to search a job database.>],
-        "missing_skills": [<list of strings, crucial skills missing for the apparent role>]
+        "extracted_keywords": [<list of strings, top 10-15 most important technical skills found.>],
+        "soft_skills": [<list of strings, top 5 soft skills found.>],
+        "missing_skills": [<list of strings, crucial skills missing for the apparent role>],
+        "summary_critique": <string, brief critique of the professional summary>
     }}
+    
+    Focus on "Impact" - look for quantifiable results (numbers, metrics) in the Work Experience.
     
     Resume Text:
     {text[:4000]} 
@@ -161,10 +196,13 @@ async def parse_resume(file: UploadFile = File(...)):
     try:
         # Extract Text
         text = extract_text(io.BytesIO(content))
-        contact = extract_contact_info(text)
+        
+        # NLP Processing for Entity Extraction
+        doc = nlp(text)
+        profile = extract_profile_info(text, doc)
         
         # 1. Calculate Rule-Based Score (Baseline)
-        rule_score = calculate_rule_based_score(text, contact)
+        rule_score = calculate_rule_based_score(text, profile)
         
         # 2. Try AI Analysis
         ai_score = await get_ai_analysis(text)
@@ -172,6 +210,7 @@ async def parse_resume(file: UploadFile = File(...)):
         # Merge Results
         final_scoring = rule_score
         keywords = extract_keywords_basic(text) # Default fallback keywords
+        soft_skills = []
 
         if ai_score:
             final_scoring = {
@@ -182,30 +221,31 @@ async def parse_resume(file: UploadFile = File(...)):
             if "missing_skills" in ai_score:
                 final_scoring["feedback"].append(f"Recommended Skills: {', '.join(ai_score['missing_skills'][:5])}")
             
-            # Use AI extracted keywords if available and valid
+            # Use AI extracted keywords if available
             if "extracted_keywords" in ai_score and ai_score["extracted_keywords"]:
                 keywords = ai_score["extracted_keywords"]
+                
+            if "soft_skills" in ai_score:
+                soft_skills = ai_score["soft_skills"]
         
         return {
             "resume": {
-                "profile": {
-                    "email": contact["email"],
-                    "phone": contact["phone"]
-                },
+                "profile": profile,
                 "text": text[:500] + "..."
             },
             "score": {
                 "totalScore": final_scoring["total_score"],
                 "breakdown": {
-                    "contactInfo": final_scoring["breakdown"]["contact_info"],
-                    "education": final_scoring["breakdown"]["structure"],
-                    "experience": final_scoring["breakdown"]["content_length"],
-                    "skills": final_scoring["breakdown"]["keywords"],
-                    "summary": 0
+                    "contactInfo": final_scoring["breakdown"].get("contact_info", 0),
+                    "structure": final_scoring["breakdown"].get("structure", 0),
+                    "experience": final_scoring["breakdown"].get("content_length", 0),
+                    "keywords": final_scoring["breakdown"].get("keywords", 0),
+                    "impact": final_scoring["breakdown"].get("impact", 0)
                 },
                 "feedback": final_scoring["feedback"]
             },
-            "keywords": keywords # Searchable keywords for Job Matching
+            "keywords": keywords,
+            "softSkills": soft_skills
         }
         
     except Exception as e:
