@@ -5,6 +5,7 @@ import io
 import json
 import base64
 import spacy
+from datetime import datetime
 from typing import Dict, Any, List
 from pdfminer.high_level import extract_text
 from sklearn.feature_extraction.text import CountVectorizer
@@ -20,15 +21,21 @@ except:
     subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
     nlp = spacy.load("en_core_web_sm")
 
-# Supabase Client
-supabase_url = os.environ.get("SUPABASE_URL")
-supabase_key = os.environ.get("SUPABASE_KEY")
+# Supabase Client - read at module load time for logging
+_supabase_url = os.environ.get("SUPABASE_URL")
+_supabase_key = os.environ.get("SUPABASE_KEY")
+
+print(f"[TASKS] SUPABASE_URL set: {bool(_supabase_url)}")
+print(f"[TASKS] SUPABASE_KEY set: {bool(_supabase_key)}")
+print(f"[TASKS] OPENAI_API_KEY set: {bool(os.environ.get('OPENAI_API_KEY'))}")
 
 def get_supabase() -> Client:
-    if not supabase_url or not supabase_key:
-        print("Warning: Supabase credentials not found.")
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        print("[TASKS] Warning: Supabase credentials not found in environment.")
         return None
-    return create_client(supabase_url, supabase_key)
+    return create_client(url, key)
 
 def extract_profile_info(text, nlp_doc):
     email = re.findall(r'[\w\.-]+@[\w\.-]+', text)
@@ -136,6 +143,7 @@ def calculate_rule_based_score(text, resume_data):
 def get_ai_analysis(text):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        print("[TASKS] OPENAI_API_KEY not found, skipping AI analysis.")
         return None
 
     client = OpenAI(api_key=api_key)
@@ -161,14 +169,16 @@ def get_ai_analysis(text):
         )
         return json.loads(response.choices[0].message.content)
     except Exception as e:
-        print(f"AI Error: {e}")
+        print(f"[TASKS] AI Error: {e}")
         return None
 
 @app.task
 def parse_resume_task(file_content_base64: str, filename: str, user_id: str = None):
+    print(f"[TASKS] Starting parse_resume_task for user: {user_id}, file: {filename}")
     try:
         content = base64.b64decode(file_content_base64)
         text = extract_text(io.BytesIO(content))
+        print(f"[TASKS] Extracted {len(text)} characters from PDF")
         
         doc = nlp(text)
         profile = extract_profile_info(text, doc)
@@ -181,6 +191,7 @@ def parse_resume_task(file_content_base64: str, filename: str, user_id: str = No
         predicted_roles = []
 
         if ai_score:
+            print("[TASKS] AI analysis completed successfully")
             final_scoring = {
                 "total_score": ai_score.get("total_score", rule_score["total_score"]),
                 "breakdown": ai_score.get("breakdown", rule_score["breakdown"]),
@@ -194,6 +205,8 @@ def parse_resume_task(file_content_base64: str, filename: str, user_id: str = No
                 soft_skills = ai_score["soft_skills"]
             if "predicted_roles" in ai_score:
                 predicted_roles = ai_score["predicted_roles"]
+        else:
+            print("[TASKS] Using rule-based scoring (no AI)")
 
         result = {
             "resume": {
@@ -218,22 +231,38 @@ def parse_resume_task(file_content_base64: str, filename: str, user_id: str = No
 
         # Save to Supabase if user_id is provided
         if user_id:
+            print(f"[TASKS] Saving to Supabase for user: {user_id}")
             db = get_supabase()
             if db:
-                db.table('resume_scores').insert({
-                    'user_id': user_id,
-                    'resume_name': filename,
-                    'total_score': final_scoring["total_score"],
-                    'score_details': result
-                }).execute()
-                
-                # Also update profile last upload time
-                db.table('profiles').update({
-                    'last_resume_upload_at': 'now()'
-                }).eq('id', user_id).execute()
+                try:
+                    # Insert resume score
+                    insert_res = db.table('resume_scores').insert({
+                        'user_id': user_id,
+                        'resume_name': filename,
+                        'total_score': final_scoring["total_score"],
+                        'score_details': result
+                    }).execute()
+                    print(f"[TASKS] Insert result: {insert_res}")
+                    
+                    # Update profile last upload time with proper datetime
+                    update_res = db.table('profiles').update({
+                        'last_resume_upload_at': datetime.utcnow().isoformat()
+                    }).eq('id', user_id).execute()
+                    print(f"[TASKS] Update result: {update_res}")
+                    
+                    print("[TASKS] Supabase save completed successfully!")
+                except Exception as db_err:
+                    print(f"[TASKS] Supabase save error: {db_err}")
+            else:
+                print("[TASKS] Supabase client is None - credentials missing!")
+        else:
+            print("[TASKS] No user_id provided, skipping Supabase save")
 
+        print("[TASKS] Task completed successfully")
         return result
 
     except Exception as e:
-        print(f"Task Failed: {e}")
+        print(f"[TASKS] Task Failed: {e}")
+        import traceback
+        traceback.print_exc()
         return {"error": str(e)}
