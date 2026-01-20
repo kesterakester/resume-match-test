@@ -1,17 +1,16 @@
 #!/bin/bash
+set -m
 
-# Start Redis in the background (using internal system service or custom script depending on container)
-# Since we are in a single container environment often on PaaS or simple runners, we might need to rely on 
-# a managed Redis or install and run it locally if this container is the 'world'.
-# However, user mentioned AWS EC2 with auto-deployment. 
-# We'll assume the container needs to run everything or connect to external infra.
-# Given the user wants to "commit -> redeploy docker", this likely builds ONE image.
+# Start Redis
+# Explicitly bind to 127.0.0.1 since we only need local access within the container
+redis-server --daemonize yes --bind 127.0.0.1
 
-# Start Redis Server
-redis-server --daemonize yes
+# Wait for redis to come up
+sleep 2
 
-# Start Celery Worker in the background
-celery -A tasks worker --loglevel=info --detach
+# Start Celery Worker in background
+# We don't use --detach so we can see logs if needed, but we background it with &
+celery -A tasks worker --loglevel=info &
 
-# Start FastAPI App
+# Start API in foreground
 uvicorn main:app --host 0.0.0.0 --port 8000
